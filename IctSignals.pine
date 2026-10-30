@@ -1,0 +1,297 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//
+// ICT Signals — flags BUY/SELL entries for the classic ICT (Inner Circle Trader) model: a
+// liquidity sweep (price wicks past a recent swing high/low, then closes back on the other side —
+// a stop hunt), followed by a Change of Character (a break of structure confirming the reversal),
+// followed by an entry on the retrace into the Fair Value Gap left by that reversal's own impulsive
+// move — restricted to the London/NY killzone windows, same as ICT is traditionally taught. Stop
+// beyond the zone's own structural extreme, target the nearest opposing swing level. Operator's own
+// ask (2026-10-25): "...and one for ict." Scoped via AskUserQuestion before writing any code —
+// same four confirmations the operator chose: sweep+CHoCH+FVG entry, killzone-restricted,
+// stop/target matching the SMC indicator's own convention.
+//
+// DELIBERATELY NOT SHARED with SmcSignals.pine despite real overlap (swing/BOS detection, FVG
+// detection, zone tracking, stop/target math, signal firing) — same "small, independent
+// implementation" convention used throughout this whole session's work (every swing/structure
+// detector in this codebase is its own fresh implementation), and Pine has no practical way to
+// share code between two local, unpublished scripts anyway.
+//
+// Same safety patterns proven in SmcSignals.pine and the Wickless Candles build before it: a
+// signal only fires when the close is still on the correct side of the zone (close >= zone bottom
+// for a buy, close <= zone top for a sell); boxes/lines use extend.right instead of a manually
+// computed future x-coordinate (avoids the "500 bars into the future" runtime error); every na
+// default uses an explicit type keyword (Pine's bool-vs-na inference is stricter than float/int).
+//
+//@version=6
+indicator('ICT Signals', shorttitle = 'ICT Signals', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// === Inputs ===
+pivotLookback  = input.int(5, 'Swing pivot lookback (bars each side)', minval = 2, maxval = 30, group = 'Structure')
+sweepValidBars = input.int(20, 'Sweep stays valid for this many bars (waiting for CHoCH)', minval = 2, maxval = 100, group = 'Structure')
+fvgValidBars   = input.int(10, 'After CHoCH, wait up to this many bars for the confirming FVG', minval = 1, maxval = 50, group = 'Structure')
+maxZonesKept   = input.int(8, 'Max untested zones kept per side', minval = 2, maxval = 40, group = 'Structure')
+
+useLondonKz = input.bool(true, 'London killzone (2:00-5:00 AM ET)', group = 'Killzones')
+useNyKz     = input.bool(true, 'NY killzone (8:30-11:00 AM ET)', group = 'Killzones')
+
+showZones     = input.bool(true, 'Show FVG entry zones', group = 'Style')
+showStructure = input.bool(true, 'Show trend state (background tint)', group = 'Style')
+showSweeps    = input.bool(true, 'Mark sweeps', group = 'Style')
+bullColor       = input.color(color.new(#089981, 80), 'Bullish zone colour', group = 'Style')
+bearColor       = input.color(color.new(#f23645, 80), 'Bearish zone colour', group = 'Style')
+buySignalColor  = input.color(color.new(#089981, 0), 'Buy signal colour', group = 'Style')
+sellSignalColor = input.color(color.new(#f23645, 0), 'Sell signal colour', group = 'Style')
+
+atrPeriod            = input.int(14, 'ATR period', minval = 2, maxval = 100, group = 'Stop/Target')
+stopBufferPoints     = input.float(1.0, 'Stop buffer beyond the zone (points)', minval = 0, step = 0.25, group = 'Stop/Target')
+maxStopAtrMult       = input.float(3.0, 'Max stop distance (x ATR)', minval = 0.5, maxval = 10, group = 'Stop/Target')
+minTargetDistPoints  = input.float(2.0, 'Min target distance (points)', minval = 0, step = 0.5, group = 'Stop/Target')
+maxTargetAtrMult     = input.float(8.0, 'Max target distance (x ATR)', minval = 0.5, maxval = 20, group = 'Stop/Target')
+targetFallbackRMult  = input.float(2.0, 'Fallback target (x stop distance, used if no opposing swing qualifies)', minval = 0.5, maxval = 10, group = 'Stop/Target')
+
+atr = ta.atr(atrPeriod)
+
+// Killzone check — Pine's own timezone-aware hour()/minute() rather than a hand-rolled conversion.
+etMinutesOfDay = hour(time, 'America/New_York') * 60 + minute(time, 'America/New_York')
+inLondonKz = etMinutesOfDay >= (2 * 60) and etMinutesOfDay < (5 * 60)
+inNyKz     = etMinutesOfDay >= (8 * 60 + 30) and etMinutesOfDay < (11 * 60)
+inKillzone = (useLondonKz and inLondonKz) or (useNyKz and inNyKz)
+
+// === Swing structure / trend (break of structure) — same mechanic as SmcSignals.pine ===
+ph = ta.pivothigh(pivotLookback, pivotLookback)
+pl = ta.pivotlow(pivotLookback, pivotLookback)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+
+var bool trendUp = false
+if not na(lastSwingHigh) and close > lastSwingHigh
+    trendUp := true
+if not na(lastSwingLow) and close < lastSwingLow
+    trendUp := false
+
+bgcolor(showStructure ? (trendUp ? color.new(#089981, 95) : color.new(#f23645, 95)) : na, title = 'Trend state')
+
+var float[] swingHighs = array.new_float()
+var float[] swingLows  = array.new_float()
+maxSwingsKept = 30
+
+if not na(ph)
+    array.push(swingHighs, ph)
+    if array.size(swingHighs) > maxSwingsKept
+        array.shift(swingHighs)
+if not na(pl)
+    array.push(swingLows, pl)
+    if array.size(swingLows) > maxSwingsKept
+        array.shift(swingLows)
+
+nearestSwing(bool wantAbove, float fromPrice) =>
+    float best = na
+    arr = wantAbove ? swingHighs : swingLows
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            v = array.get(arr, i)
+            qualifies = wantAbove ? v > fromPrice : v < fromPrice
+            if qualifies and (na(best) or (wantAbove ? v < best : v > best))
+                best := v
+    best
+
+// === Liquidity sweep -> CHoCH -> armed-for-FVG state machine ===
+// A sweep is a WICK beyond a recent swing that then CLOSES back on the other side (a stop hunt) —
+// mutually exclusive with a BOS (which needs the CLOSE itself to break through), so the two can
+// never fire on the same bar.
+bearishSweep = not na(lastSwingHigh) and high > lastSwingHigh and close < lastSwingHigh
+bullishSweep = not na(lastSwingLow) and low < lastSwingLow and close > lastSwingLow
+
+var int sweepDirection = 0   // 0 none, 1 = swept a low (bullish setup), -1 = swept a high (bearish setup)
+var int sweepBarIndex  = na
+
+if bearishSweep
+    sweepDirection := -1
+    sweepBarIndex := bar_index
+    if showSweeps
+        label.new(bar_index, high, 'SWEEP', style = label.style_label_down, color = color.new(sellSignalColor, 30), textcolor = color.white, size = size.tiny)
+if bullishSweep
+    sweepDirection := 1
+    sweepBarIndex := bar_index
+    if showSweeps
+        label.new(bar_index, low, 'SWEEP', style = label.style_label_up, color = color.new(buySignalColor, 30), textcolor = color.white, size = size.tiny)
+
+if sweepDirection != 0 and (bar_index - sweepBarIndex) > sweepValidBars
+    sweepDirection := 0
+
+bullishBos = trendUp and not trendUp[1]
+bearishBos = (not trendUp) and trendUp[1]
+
+bullishChoch = bullishBos and sweepDirection == 1 and (bar_index - sweepBarIndex) <= sweepValidBars
+bearishChoch = bearishBos and sweepDirection == -1 and (bar_index - sweepBarIndex) <= sweepValidBars
+
+var int armedForFvgDirection = 0   // 0 none, 1 bullish, -1 bearish — waiting for the CHoCH's own confirming FVG
+var int armedForFvgBarIndex  = na
+
+if bullishChoch
+    armedForFvgDirection := 1
+    armedForFvgBarIndex := bar_index
+    sweepDirection := 0
+if bearishChoch
+    armedForFvgDirection := -1
+    armedForFvgBarIndex := bar_index
+    sweepDirection := 0
+
+if armedForFvgDirection != 0 and (bar_index - armedForFvgBarIndex) > fvgValidBars
+    armedForFvgDirection := 0
+
+// === Zones — only the ONE confirming FVG per armed CHoCH becomes a trackable entry zone, not
+// every FVG indiscriminately (that's what tells this indicator's entries apart from SmcSignals.pine's
+// own "every FVG counts" rule). ===
+type zone
+    float top
+    float bottom
+
+var zone[] bullZones = array.new<zone>()
+var box[]  bullBoxes = array.new<box>()
+var zone[] bearZones = array.new<zone>()
+var box[]  bearBoxes = array.new<box>()
+
+bullishFvg = low > high[2]
+bearishFvg = high < low[2]
+
+if armedForFvgDirection == 1 and bullishFvg
+    fTop = low
+    fBot = high[2]
+    box newBox = na
+    if showZones
+        newBox := box.new(bar_index[2], fTop, bar_index, fBot, border_color = color.new(bullColor, 40), bgcolor = bullColor, extend = extend.right)
+    array.push(bullZones, zone.new(fTop, fBot))
+    array.push(bullBoxes, newBox)
+    if array.size(bullZones) > maxZonesKept
+        array.shift(bullZones)
+        oldBox = array.shift(bullBoxes)
+        if not na(oldBox)
+            box.delete(oldBox)
+    armedForFvgDirection := 0
+
+if armedForFvgDirection == -1 and bearishFvg
+    fTop = low[2]
+    fBot = high
+    box newBox = na
+    if showZones
+        newBox := box.new(bar_index[2], fTop, bar_index, fBot, border_color = color.new(bearColor, 40), bgcolor = bearColor, extend = extend.right)
+    array.push(bearZones, zone.new(fTop, fBot))
+    array.push(bearBoxes, newBox)
+    if array.size(bearZones) > maxZonesKept
+        array.shift(bearZones)
+        oldBox = array.shift(bearBoxes)
+        if not na(oldBox)
+            box.delete(oldBox)
+    armedForFvgDirection := 0
+
+// === Active trade plan — one at a time, same convention as SmcSignals.pine / the operator's own
+// Quantower strategies. ===
+var bool  hasTrade    = false
+var bool  tradeIsLong = false
+var float tradeStop   = na
+var float tradeTarget = na
+var line  stopLine    = na
+var line  targetLine  = na
+var label stopLabel   = na
+var label targetLabel = na
+
+if hasTrade
+    hitSl = tradeIsLong ? low <= tradeStop : high >= tradeStop
+    hitTp = tradeIsLong ? high >= tradeTarget : low <= tradeTarget
+    if hitSl or hitTp
+        if not na(stopLine)
+            line.set_extend(stopLine, extend.none)
+            line.set_x2(stopLine, bar_index)
+        if not na(targetLine)
+            line.set_extend(targetLine, extend.none)
+            line.set_x2(targetLine, bar_index)
+        hasTrade := false
+
+// === Bullish zones: mitigation + signal (killzone-gated) ===
+if array.size(bullZones) > 0
+    for i = array.size(bullZones) - 1 to 0
+        z = array.get(bullZones, i)
+        if high >= z.bottom and low <= z.top
+            b = array.get(bullBoxes, i)
+            if not na(b)
+                box.set_extend(b, extend.none)
+                box.set_right(b, bar_index)
+            if trendUp and close >= z.bottom and inKillzone
+                entryPrice = close
+                rawStopDist = entryPrice - (z.bottom - stopBufferPoints)
+                stopDist = math.min(rawStopDist, atr * maxStopAtrMult)
+                if stopDist > 0
+                    stopPrice = entryPrice - stopDist
+                    maxTgtDist = atr * maxTargetAtrMult
+                    nearHigh = nearestSwing(true, entryPrice)
+                    swingQualifies = not na(nearHigh) and (nearHigh - entryPrice) <= maxTgtDist and (nearHigh - entryPrice) >= minTargetDistPoints
+                    targetPrice = swingQualifies ? nearHigh : entryPrice + math.min(stopDist * targetFallbackRMult, maxTgtDist)
+
+                    hasTrade := true
+                    tradeIsLong := true
+                    tradeStop := stopPrice
+                    tradeTarget := targetPrice
+
+                    if not na(stopLine)
+                        line.delete(stopLine)
+                    if not na(targetLine)
+                        line.delete(targetLine)
+                    if not na(stopLabel)
+                        label.delete(stopLabel)
+                    if not na(targetLabel)
+                        label.delete(targetLabel)
+                    stopLine := line.new(bar_index, stopPrice, bar_index + 1, stopPrice, extend = extend.right, color = sellSignalColor, style = line.style_dashed, width = 1)
+                    targetLine := line.new(bar_index, targetPrice, bar_index + 1, targetPrice, extend = extend.right, color = buySignalColor, style = line.style_dashed, width = 1)
+                    stopLabel := label.new(bar_index, stopPrice, 'SL ' + str.tostring(stopPrice, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = sellSignalColor, size = size.small)
+                    targetLabel := label.new(bar_index, targetPrice, 'TP ' + str.tostring(targetPrice, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = buySignalColor, size = size.small)
+                    label.new(bar_index, low, 'BUY ▲', style = label.style_label_up, color = buySignalColor, textcolor = color.white, size = size.normal)
+            array.remove(bullZones, i)
+            array.remove(bullBoxes, i)
+
+// === Bearish zones: mitigation + signal (killzone-gated) ===
+if array.size(bearZones) > 0
+    for i = array.size(bearZones) - 1 to 0
+        z = array.get(bearZones, i)
+        if high >= z.bottom and low <= z.top
+            b = array.get(bearBoxes, i)
+            if not na(b)
+                box.set_extend(b, extend.none)
+                box.set_right(b, bar_index)
+            if (not trendUp) and close <= z.top and inKillzone
+                entryPrice = close
+                rawStopDist = (z.top + stopBufferPoints) - entryPrice
+                stopDist = math.min(rawStopDist, atr * maxStopAtrMult)
+                if stopDist > 0
+                    stopPrice = entryPrice + stopDist
+                    maxTgtDist = atr * maxTargetAtrMult
+                    nearLow = nearestSwing(false, entryPrice)
+                    swingQualifies = not na(nearLow) and (entryPrice - nearLow) <= maxTgtDist and (entryPrice - nearLow) >= minTargetDistPoints
+                    targetPrice = swingQualifies ? nearLow : entryPrice - math.min(stopDist * targetFallbackRMult, maxTgtDist)
+
+                    hasTrade := true
+                    tradeIsLong := false
+                    tradeStop := stopPrice
+                    tradeTarget := targetPrice
+
+                    if not na(stopLine)
+                        line.delete(stopLine)
+                    if not na(targetLine)
+                        line.delete(targetLine)
+                    if not na(stopLabel)
+                        label.delete(stopLabel)
+                    if not na(targetLabel)
+                        label.delete(targetLabel)
+                    stopLine := line.new(bar_index, stopPrice, bar_index + 1, stopPrice, extend = extend.right, color = buySignalColor, style = line.style_dashed, width = 1)
+                    targetLine := line.new(bar_index, targetPrice, bar_index + 1, targetPrice, extend = extend.right, color = sellSignalColor, style = line.style_dashed, width = 1)
+                    stopLabel := label.new(bar_index, stopPrice, 'SL ' + str.tostring(stopPrice, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = buySignalColor, size = size.small)
+                    targetLabel := label.new(bar_index, targetPrice, 'TP ' + str.tostring(targetPrice, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = sellSignalColor, size = size.small)
+                    label.new(bar_index, high, 'SELL ▼', style = label.style_label_down, color = sellSignalColor, textcolor = color.white, size = size.normal)
+            array.remove(bearZones, i)
+            array.remove(bearBoxes, i)

@@ -1,0 +1,285 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//
+// SMC Signals — flags BUY/SELL entries for a Smart Money Concepts style setup: trend confirmed by
+// a break of structure, entry on the retrace into the nearest untested order block or Fair Value
+// Gap in that direction, stop beyond the zone's own structural extreme, target at the nearest
+// opposing swing level. Operator's own ask (2026-10-25): "make me a new indicator that shows me
+// when to buy and sell and were to put my take profit and stop loss for trading smc." Scoped via
+// AskUserQuestion before writing any code — confirmed: trend (BOS) + retrace into OB/FVG as the
+// entry trigger; stop beyond the zone's own swing point (capped at a max ATR distance); target the
+// nearest opposing liquidity, falling back to a fixed reward:risk multiple when nothing qualifies.
+//
+// Built fresh and deliberately LEAN rather than reusing the operator's own smc.pine (LuxAlgo) —
+// that script is a large, general-purpose visual toolkit; this one computes only what a mechanical
+// signal needs (one trend state, a small set of untested zones, one active trade plan at a time).
+// Uses Pine's own built-in ta.pivothigh/ta.pivotlow/ta.lowestbars/ta.highestbars for swing
+// detection and order-block anchoring rather than hand-rolled loops — well-tested built-ins, lower
+// bug surface than re-deriving the same math by hand, a real lesson from this session's own
+// Wickless Candles build (several rounds of hand-rolled-logic bugs there).
+//
+// SAFETY GUARD carried over from srmAutoStrategy's own hard-won lesson (Quantower side of this same
+// operator's work): a signal only fires when the CLOSE is still on the correct side of the zone
+// (close >= zone bottom for a buy, close <= zone top for a sell) — a bar that wicks into a zone and
+// then closes back through it would otherwise hand back a stop on the wrong side of entry.
+//
+// Boxes and lines use extend.right (auto-extend to the current right edge) rather than manually
+// computing a future x-coordinate each bar — sidesteps the "cannot be drawn further than 500 bars
+// into the future" runtime error the Wickless Candles script hit from doing that by hand.
+//
+//@version=6
+indicator('SMC Signals', shorttitle = 'SMC Signals', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// === Inputs ===
+pivotLookback = input.int(5, 'Swing pivot lookback (bars each side)', minval = 2, maxval = 30, group = 'Structure')
+obSearchBars  = input.int(15, 'Order block search window (bars)', minval = 3, maxval = 50, group = 'Structure', tooltip = 'How far back from a break of structure to look for the order block candle (the most extreme candle in this window).')
+maxZonesKept  = input.int(8, 'Max untested zones kept per side', minval = 2, maxval = 40, group = 'Structure')
+
+showZones     = input.bool(true, 'Show order block / FVG zones', group = 'Style')
+showStructure = input.bool(true, 'Show trend state (background tint)', group = 'Style')
+bullColor       = input.color(color.new(#089981, 80), 'Bullish zone colour', group = 'Style')
+bearColor       = input.color(color.new(#f23645, 80), 'Bearish zone colour', group = 'Style')
+buySignalColor  = input.color(color.new(#089981, 0), 'Buy signal colour', group = 'Style')
+sellSignalColor = input.color(color.new(#f23645, 0), 'Sell signal colour', group = 'Style')
+
+atrPeriod            = input.int(14, 'ATR period', minval = 2, maxval = 100, group = 'Stop/Target')
+stopBufferPoints     = input.float(1.0, 'Stop buffer beyond the zone (points)', minval = 0, step = 0.25, group = 'Stop/Target')
+maxStopAtrMult       = input.float(3.0, 'Max stop distance (x ATR)', minval = 0.5, maxval = 10, group = 'Stop/Target')
+minTargetDistPoints  = input.float(2.0, 'Min target distance (points)', minval = 0, step = 0.5, group = 'Stop/Target')
+maxTargetAtrMult     = input.float(8.0, 'Max target distance (x ATR)', minval = 0.5, maxval = 20, group = 'Stop/Target')
+targetFallbackRMult  = input.float(2.0, 'Fallback target (x stop distance, used if no opposing swing qualifies)', minval = 0.5, maxval = 10, group = 'Stop/Target')
+
+atr = ta.atr(atrPeriod)
+
+// === Swing structure / trend (break of structure) ===
+ph = ta.pivothigh(pivotLookback, pivotLookback)
+pl = ta.pivotlow(pivotLookback, pivotLookback)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+
+var bool trendUp = false
+if not na(lastSwingHigh) and close > lastSwingHigh
+    trendUp := true
+if not na(lastSwingLow) and close < lastSwingLow
+    trendUp := false
+
+bgcolor(showStructure ? (trendUp ? color.new(#089981, 95) : color.new(#f23645, 95)) : na, title = 'Trend state')
+
+// Recent confirmed swing points, for target lookups — bounded array, oldest dropped first.
+var float[] swingHighs = array.new_float()
+var float[] swingLows  = array.new_float()
+maxSwingsKept = 30
+
+if not na(ph)
+    array.push(swingHighs, ph)
+    if array.size(swingHighs) > maxSwingsKept
+        array.shift(swingHighs)
+if not na(pl)
+    array.push(swingLows, pl)
+    if array.size(swingLows) > maxSwingsKept
+        array.shift(swingLows)
+
+// @function   Nearest swing level beyond `fromPrice` in the wanted direction — used for targets.
+nearestSwing(bool wantAbove, float fromPrice) =>
+    float best = na
+    arr = wantAbove ? swingHighs : swingLows
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            v = array.get(arr, i)
+            qualifies = wantAbove ? v > fromPrice : v < fromPrice
+            if qualifies and (na(best) or (wantAbove ? v < best : v > best))
+                best := v
+    best
+
+// === Zones: order blocks (from a break of structure) + Fair Value Gaps (every bar) ===
+type zone
+    float top
+    float bottom
+    bool  isBullish
+
+var zone[] bullZones = array.new<zone>()
+var box[]  bullBoxes = array.new<box>()
+var zone[] bearZones = array.new<zone>()
+var box[]  bearBoxes = array.new<box>()
+
+bullishBos = trendUp and not trendUp[1]
+bearishBos = (not trendUp) and trendUp[1]
+
+if bullishBos
+    offset = -ta.lowestbars(low, obSearchBars)
+    obBot  = low[offset]
+    obTop  = high[offset]
+    if (obTop - obBot) > 0
+        box newBox = na
+        if showZones
+            newBox := box.new(bar_index[offset], obTop, bar_index, obBot, border_color = color.new(bullColor, 40), bgcolor = bullColor, extend = extend.right)
+        array.push(bullZones, zone.new(obTop, obBot, true))
+        array.push(bullBoxes, newBox)
+        if array.size(bullZones) > maxZonesKept
+            array.shift(bullZones)
+            oldBox = array.shift(bullBoxes)
+            if not na(oldBox)
+                box.delete(oldBox)
+
+if bearishBos
+    offset = -ta.highestbars(high, obSearchBars)
+    obTop  = high[offset]
+    obBot  = low[offset]
+    if (obTop - obBot) > 0
+        box newBox = na
+        if showZones
+            newBox := box.new(bar_index[offset], obTop, bar_index, obBot, border_color = color.new(bearColor, 40), bgcolor = bearColor, extend = extend.right)
+        array.push(bearZones, zone.new(obTop, obBot, false))
+        array.push(bearBoxes, newBox)
+        if array.size(bearZones) > maxZonesKept
+            array.shift(bearZones)
+            oldBox = array.shift(bearBoxes)
+            if not na(oldBox)
+                box.delete(oldBox)
+
+// Fair Value Gaps — classic 3-candle imbalance, checked every bar.
+bullishFvg = low > high[2]
+bearishFvg = high < low[2]
+
+if bullishFvg
+    fTop = low
+    fBot = high[2]
+    box newBox = na
+    if showZones
+        newBox := box.new(bar_index[2], fTop, bar_index, fBot, border_color = color.new(bullColor, 60), bgcolor = color.new(bullColor, 85), extend = extend.right)
+    array.push(bullZones, zone.new(fTop, fBot, true))
+    array.push(bullBoxes, newBox)
+    if array.size(bullZones) > maxZonesKept
+        array.shift(bullZones)
+        oldBox = array.shift(bullBoxes)
+        if not na(oldBox)
+            box.delete(oldBox)
+
+if bearishFvg
+    fTop = low[2]
+    fBot = high
+    box newBox = na
+    if showZones
+        newBox := box.new(bar_index[2], fTop, bar_index, fBot, border_color = color.new(bearColor, 60), bgcolor = color.new(bearColor, 85), extend = extend.right)
+    array.push(bearZones, zone.new(fTop, fBot, false))
+    array.push(bearBoxes, newBox)
+    if array.size(bearZones) > maxZonesKept
+        array.shift(bearZones)
+        oldBox = array.shift(bearBoxes)
+        if not na(oldBox)
+            box.delete(oldBox)
+
+// === Active trade plan — one at a time, matching the "never more than one position open at once"
+// discipline used throughout the operator's own Quantower strategies. A new signal simply replaces
+// whatever was previously tracked. ===
+var bool  hasTrade    = false
+var bool  tradeIsLong = false
+var float tradeStop   = na
+var float tradeTarget = na
+var line  stopLine    = na
+var line  targetLine  = na
+var label stopLabel   = na
+var label targetLabel = na
+
+// Resolve the active trade plan first (before any new signal this bar can replace it) — once
+// price hits either the stop or the target, freeze the lines in place (stop extending) rather
+// than deleting them, same "keep a visible record" convention as the Wickless Candles script's
+// own tested-level handling.
+if hasTrade
+    hitSl = tradeIsLong ? low <= tradeStop : high >= tradeStop
+    hitTp = tradeIsLong ? high >= tradeTarget : low <= tradeTarget
+    if hitSl or hitTp
+        if not na(stopLine)
+            line.set_extend(stopLine, extend.none)
+            line.set_x2(stopLine, bar_index)
+        if not na(targetLine)
+            line.set_extend(targetLine, extend.none)
+            line.set_x2(targetLine, bar_index)
+        hasTrade := false
+
+// === Bullish zones: mitigation + signal ===
+if array.size(bullZones) > 0
+    for i = array.size(bullZones) - 1 to 0
+        z = array.get(bullZones, i)
+        if high >= z.bottom and low <= z.top
+            b = array.get(bullBoxes, i)
+            if not na(b)
+                box.set_extend(b, extend.none)
+                box.set_right(b, bar_index)
+            if trendUp and close >= z.bottom
+                entryPrice = close
+                rawStopDist = entryPrice - (z.bottom - stopBufferPoints)
+                stopDist = math.min(rawStopDist, atr * maxStopAtrMult)
+                if stopDist > 0
+                    stopPrice = entryPrice - stopDist
+                    maxTgtDist = atr * maxTargetAtrMult
+                    nearHigh = nearestSwing(true, entryPrice)
+                    swingQualifies = not na(nearHigh) and (nearHigh - entryPrice) <= maxTgtDist and (nearHigh - entryPrice) >= minTargetDistPoints
+                    targetPrice = swingQualifies ? nearHigh : entryPrice + math.min(stopDist * targetFallbackRMult, maxTgtDist)
+
+                    hasTrade := true
+                    tradeIsLong := true
+                    tradeStop := stopPrice
+                    tradeTarget := targetPrice
+
+                    if not na(stopLine)
+                        line.delete(stopLine)
+                    if not na(targetLine)
+                        line.delete(targetLine)
+                    if not na(stopLabel)
+                        label.delete(stopLabel)
+                    if not na(targetLabel)
+                        label.delete(targetLabel)
+                    stopLine := line.new(bar_index, stopPrice, bar_index + 1, stopPrice, extend = extend.right, color = sellSignalColor, style = line.style_dashed, width = 1)
+                    targetLine := line.new(bar_index, targetPrice, bar_index + 1, targetPrice, extend = extend.right, color = buySignalColor, style = line.style_dashed, width = 1)
+                    stopLabel := label.new(bar_index, stopPrice, 'SL ' + str.tostring(stopPrice, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = sellSignalColor, size = size.small)
+                    targetLabel := label.new(bar_index, targetPrice, 'TP ' + str.tostring(targetPrice, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = buySignalColor, size = size.small)
+                    label.new(bar_index, low, 'BUY ▲', style = label.style_label_up, color = buySignalColor, textcolor = color.white, size = size.normal)
+            array.remove(bullZones, i)
+            array.remove(bullBoxes, i)
+
+// === Bearish zones: mitigation + signal ===
+if array.size(bearZones) > 0
+    for i = array.size(bearZones) - 1 to 0
+        z = array.get(bearZones, i)
+        if high >= z.bottom and low <= z.top
+            b = array.get(bearBoxes, i)
+            if not na(b)
+                box.set_extend(b, extend.none)
+                box.set_right(b, bar_index)
+            if (not trendUp) and close <= z.top
+                entryPrice = close
+                rawStopDist = (z.top + stopBufferPoints) - entryPrice
+                stopDist = math.min(rawStopDist, atr * maxStopAtrMult)
+                if stopDist > 0
+                    stopPrice = entryPrice + stopDist
+                    maxTgtDist = atr * maxTargetAtrMult
+                    nearLow = nearestSwing(false, entryPrice)
+                    swingQualifies = not na(nearLow) and (entryPrice - nearLow) <= maxTgtDist and (entryPrice - nearLow) >= minTargetDistPoints
+                    targetPrice = swingQualifies ? nearLow : entryPrice - math.min(stopDist * targetFallbackRMult, maxTgtDist)
+
+                    hasTrade := true
+                    tradeIsLong := false
+                    tradeStop := stopPrice
+                    tradeTarget := targetPrice
+
+                    if not na(stopLine)
+                        line.delete(stopLine)
+                    if not na(targetLine)
+                        line.delete(targetLine)
+                    if not na(stopLabel)
+                        label.delete(stopLabel)
+                    if not na(targetLabel)
+                        label.delete(targetLabel)
+                    stopLine := line.new(bar_index, stopPrice, bar_index + 1, stopPrice, extend = extend.right, color = buySignalColor, style = line.style_dashed, width = 1)
+                    targetLine := line.new(bar_index, targetPrice, bar_index + 1, targetPrice, extend = extend.right, color = sellSignalColor, style = line.style_dashed, width = 1)
+                    stopLabel := label.new(bar_index, stopPrice, 'SL ' + str.tostring(stopPrice, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = buySignalColor, size = size.small)
+                    targetLabel := label.new(bar_index, targetPrice, 'TP ' + str.tostring(targetPrice, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = sellSignalColor, size = size.small)
+                    label.new(bar_index, high, 'SELL ▼', style = label.style_label_down, color = sellSignalColor, textcolor = color.white, size = size.normal)
+            array.remove(bearZones, i)
+            array.remove(bearBoxes, i)

@@ -1,0 +1,321 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//
+// Daily Structure Bias — marks confirmed DAILY swing highs ("Bearish High") and swing lows
+// ("Bullish Low"), always computed from the DAILY timeframe regardless of what chart you're
+// actually viewing, plus a top-right bias box showing whether the day is currently trading
+// bullish or bearish. Operator's own ask (2026-10-29): "What i like to do is start on the daily
+// chart and see if we are bulish or bearish for the day and mark out the levels like this... I
+// will need these lines to show bullish low and bearish high so i know if we break the low marked
+// out we are breaking that structure for the short," then mid-turn: "there needs to be a box in
+// the top right of the chart that [shows] the days time frame bias."
+//
+// WHY A SWING LOW IS LABELED "BULLISH" AND A SWING HIGH "BEARISH": not about the CURRENT bias
+// state, but about which side each level protects — a swing low is the level bulls need to hold
+// for the move to stay bullish (break it = bearish structure shift, a short signal); a swing high
+// is the level bears need to hold (break it = bullish structure shift, a long signal). EVERY
+// confirmed daily swing gets this label, not just the ones matching whatever the bias happens to
+// be when it forms — matches the operator's own screenshot, which keeps several historical levels
+// visible at once, not just a single current one.
+//
+// DAILY AGGREGATION IS SELF-BUILT (operator's own explicit choice: always compute from the daily
+// chart, regardless of what's being viewed) — NOT the same UTC-modular-boundary trick the Wickless
+// Candles MTF script uses for 5m/15m/1H/4H. Those periods evenly divide a day; a calendar DAY does
+// NOT divide evenly in raw UTC milliseconds once DST transitions are involved, so a running
+// accumulator instead resets whenever a SESSION-DAY KEY changes, computed from Pine's own
+// timezone-aware year()/month()/dayofmonth()/hour() built-ins, anchored at `dayStartHour` ET
+// (default 18:00 — the same 6pm ET Globex/CME session-open convention already established in the
+// operator's own untestedLevels.pine). A bar at/after that hour belongs to TOMORROW's session
+// day — computed by shifting the raw UTC timestamp forward 24h before re-extracting Y/M/D in ET,
+// letting Pine's own built-ins handle month/year rollover and leap years instead of hand-rolled
+// calendar math.
+//
+// DAILY PIVOT DETECTION IS HAND-ROLLED — ta.pivothigh/ta.pivotlow only count NATIVE bars for their
+// own left/right window, not "days"; feeding them a once-per-day-changing series would check
+// native bars each side, not days, so they can't be reused here. Same fractal confirmation-lag
+// rule as every other swing detector already built in this operator's codebase: a candidate day is
+// confirmed once `pivotLookback` NEWER finalized days exist on top of it, each checked against the
+// identical window on the other side.
+//
+// STRUCTURE-BREAK DETECTION USES THE NATIVE CHART'S OWN LIVE CLOSE (not just the daily close) —
+// checked every bar for real-time feedback the instant a close trades through a marked level,
+// matching the explicit ask ("so i know if we break the low marked out"), not just once a full
+// daily candle finishes. Requires an actual CLOSE through the level, not a wick — same "close, not
+// a mere touch" discipline the SMC/ICT Signals indicators already use for their own structure
+// breaks.
+//
+//@version=6
+indicator('Daily Structure Bias', shorttitle = 'Daily Bias', overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// === Inputs ===
+pivotLookback = input.int(2, 'Daily swing pivot lookback (days each side)', minval = 1, maxval = 10, group = 'Structure')
+dayStartHour  = input.int(18, 'Daily session start hour (ET)', minval = 0, maxval = 23, group = 'Structure', tooltip = 'Matches CME/Globex\'s own ~6pm ET session open — a bar at/after this hour counts toward TOMORROW\'s daily session, same convention already used in the operator\'s own untestedLevels.pine.')
+maxLevelsKept = input.int(10, 'Max levels kept per side', minval = 2, maxval = 50, group = 'Structure')
+showBroken    = input.bool(true, 'Keep broken/disrespected levels visible (dashed, dimmed) instead of deleting them', group = 'Style')
+
+bullLowColor  = input.color(color.new(#089981, 0), 'Bullish Low colour', group = 'Style')
+bearHighColor = input.color(color.new(#f23645, 0), 'Bearish High colour', group = 'Style')
+currentWidth  = input.int(2, 'Current level line width', minval = 1, maxval = 4, group = 'Style')
+historyWidth  = input.int(1, 'Historical level line width', minval = 1, maxval = 4, group = 'Style')
+labelOffsetBars = input.int(2, 'Label offset past current candle (bars)', minval = 0, maxval = 20, group = 'Style')
+
+showBiasBox = input.bool(true, 'Show daily bias box (top right)', group = 'Bias Box')
+
+// === Daily session-day key (ET, anchored at dayStartHour) ===
+etHourNow    = hour(time, 'America/New_York')
+sessionTime  = etHourNow >= dayStartHour ? time + 86400000 : time
+sessionYear  = year(sessionTime, 'America/New_York')
+sessionMonth = month(sessionTime, 'America/New_York')
+sessionDay   = dayofmonth(sessionTime, 'America/New_York')
+sessionDayKey = (sessionYear * 10000) + (sessionMonth * 100) + sessionDay
+
+// === Daily accumulator — resets whenever sessionDayKey changes, same accumulator shape as the
+// Wickless Candles MTF script's own higher-timeframe aggregation. ===
+var int   accDayKey     = na
+var float accH          = na
+var float accL          = na
+var float accC          = na
+var int   accStartTime  = na
+var bool  accValid      = false
+
+var float[] dayHighs = array.new_float()
+var float[] dayLows  = array.new_float()
+var int[]   dayTimes = array.new_int()
+maxDaysKept = 400
+
+float newDayHigh = na
+float newDayLow  = na
+int   newDayTime = na
+haveNewDay = accValid and sessionDayKey != accDayKey
+
+if haveNewDay
+    newDayHigh := accH
+    newDayLow  := accL
+    newDayTime := accStartTime
+
+if not accValid or sessionDayKey != accDayKey
+    accDayKey := sessionDayKey
+    accValid := true
+    accH := high
+    accL := low
+    accC := close
+    accStartTime := time
+else
+    accH := math.max(accH, high)
+    accL := math.min(accL, low)
+    accC := close
+
+if haveNewDay
+    array.push(dayHighs, newDayHigh)
+    array.push(dayLows, newDayLow)
+    array.push(dayTimes, newDayTime)
+    if array.size(dayHighs) > maxDaysKept
+        array.shift(dayHighs)
+        array.shift(dayLows)
+        array.shift(dayTimes)
+
+// @function   Checks for a confirmed daily pivot once enough newer finalized days exist on top of
+//              the candidate day. `gate` (true only on the bar a new day just finalized) keeps this
+//              from re-scanning every single native bar for no reason. Returns via tuple rather
+//              than mutating an outer-scope variable, matching the Wickless Candles MTF script's
+//              own established pattern for the same reason.
+checkDayPivot(bool gate) =>
+    bool  isHigh = false
+    bool  isLow  = false
+    float candHigh = na
+    float candLow  = na
+    int   candTime = na
+    if gate
+        n = array.size(dayHighs)
+        if n >= (2 * pivotLookback + 1)
+            idx = n - 1 - pivotLookback
+            candHigh := array.get(dayHighs, idx)
+            candLow  := array.get(dayLows, idx)
+            candTime := array.get(dayTimes, idx)
+            isHigh := true
+            isLow  := true
+            for j = idx - pivotLookback to idx + pivotLookback
+                if j != idx
+                    if array.get(dayHighs, j) >= candHigh
+                        isHigh := false
+                    if array.get(dayLows, j) <= candLow
+                        isLow := false
+    [isHigh, isLow, candHigh, candLow, candTime]
+
+[pivotIsHigh, pivotIsLow, pivotHighPrice, pivotLowPrice, pivotTime] = checkDayPivot(haveNewDay)
+
+// === Bullish Low / Bearish High level tracking — bounded history, current one highlighted ===
+var line[]  bullLines  = array.new_line()
+var label[] bullLabels = array.new_label()
+var float[] bullPrices = array.new_float()
+var bool[]  bullBroken = array.new_bool()
+var int[]   bullBounces = array.new_int()
+
+var line[]  bearLines  = array.new_line()
+var label[] bearLabels = array.new_label()
+var float[] bearPrices = array.new_float()
+var bool[]  bearBroken = array.new_bool()
+var int[]   bearBounces = array.new_int()
+
+var float currentBullLow   = na
+var float currentBearHigh  = na
+var bool  bullTouchActive  = false
+var bool  bearTouchActive  = false
+var bool  dailyBiasBullish = true
+
+if pivotIsLow
+    if array.size(bullLines) > 0
+        prevLine = array.get(bullLines, array.size(bullLines) - 1)
+        if not na(prevLine)
+            line.set_width(prevLine, historyWidth)
+    newLine  = line.new(pivotTime, pivotLowPrice, time, pivotLowPrice, xloc = xloc.bar_time, extend = extend.right, color = bullLowColor, width = currentWidth, style = line.style_solid)
+    newLabel = label.new(bar_index, pivotLowPrice, 'Bull Low ' + str.tostring(pivotLowPrice, format.mintick), style = label.style_label_left, color = color.new(color.black, 15), textcolor = bullLowColor, size = size.normal)
+    array.push(bullLines, newLine)
+    array.push(bullLabels, newLabel)
+    array.push(bullPrices, pivotLowPrice)
+    array.push(bullBroken, false)
+    array.push(bullBounces, 0)
+    currentBullLow := pivotLowPrice
+    bullTouchActive := false
+    if array.size(bullLines) > maxLevelsKept
+        oldLine  = array.shift(bullLines)
+        oldLabel = array.shift(bullLabels)
+        array.shift(bullPrices)
+        array.shift(bullBroken)
+        array.shift(bullBounces)
+        if not na(oldLine)
+            line.delete(oldLine)
+        if not na(oldLabel)
+            label.delete(oldLabel)
+
+if pivotIsHigh
+    if array.size(bearLines) > 0
+        prevLine = array.get(bearLines, array.size(bearLines) - 1)
+        if not na(prevLine)
+            line.set_width(prevLine, historyWidth)
+    newLine  = line.new(pivotTime, pivotHighPrice, time, pivotHighPrice, xloc = xloc.bar_time, extend = extend.right, color = bearHighColor, width = currentWidth, style = line.style_solid)
+    newLabel = label.new(bar_index, pivotHighPrice, 'Bear High ' + str.tostring(pivotHighPrice, format.mintick), style = label.style_label_left, color = color.new(color.black, 15), textcolor = bearHighColor, size = size.normal)
+    array.push(bearLines, newLine)
+    array.push(bearLabels, newLabel)
+    array.push(bearPrices, pivotHighPrice)
+    array.push(bearBroken, false)
+    array.push(bearBounces, 0)
+    currentBearHigh := pivotHighPrice
+    bearTouchActive := false
+    if array.size(bearLines) > maxLevelsKept
+        oldLine  = array.shift(bearLines)
+        oldLabel = array.shift(bearLabels)
+        array.shift(bearPrices)
+        array.shift(bearBroken)
+        array.shift(bearBounces)
+        if not na(oldLine)
+            line.delete(oldLine)
+        if not na(oldLabel)
+            label.delete(oldLabel)
+
+// === Real-time break / bounce detection (native price action, every bar) — a CLOSE through the
+// level is a break (disrespected: line freezes at the breaking candle, turns dashed, no longer
+// extends right); a WICK that reaches the level but closes back on the right side is a bounce
+// (respected: line stays solid, label gets an updated bounce count). bullTouchActive/
+// bearTouchActive edge-guard the bounce counter so a price that simply hovers at the level across
+// many native bars counts as ONE bounce, not one per bar. ===
+if not na(currentBullLow)
+    lastIdx = array.size(bullBroken) - 1
+    if lastIdx >= 0 and not array.get(bullBroken, lastIdx)
+        ln  = array.get(bullLines, lastIdx)
+        lbl = array.get(bullLabels, lastIdx)
+        if close < currentBullLow
+            array.set(bullBroken, lastIdx, true)
+            if showBroken
+                if not na(ln)
+                    line.set_extend(ln, extend.none)
+                    line.set_x2(ln, time)
+                    line.set_style(ln, line.style_dashed)
+                    line.set_color(ln, color.new(bullLowColor, 60))
+                if not na(lbl)
+                    label.set_text(lbl, 'Bull Low ' + str.tostring(array.get(bullPrices, lastIdx), format.mintick) + ' ✕')
+            else
+                if not na(ln)
+                    line.delete(ln)
+                if not na(lbl)
+                    label.delete(lbl)
+                array.pop(bullLines)
+                array.pop(bullLabels)
+                array.pop(bullPrices)
+                array.pop(bullBroken)
+                array.pop(bullBounces)
+            currentBullLow := na
+            bullTouchActive := false
+            dailyBiasBullish := false
+        else if low <= currentBullLow
+            if not bullTouchActive
+                newCount = array.get(bullBounces, lastIdx) + 1
+                array.set(bullBounces, lastIdx, newCount)
+                if not na(lbl)
+                    label.set_text(lbl, 'Bull Low ' + str.tostring(array.get(bullPrices, lastIdx), format.mintick) + ' (bounced ' + str.tostring(newCount) + 'x)')
+            bullTouchActive := true
+        else
+            bullTouchActive := false
+
+if not na(currentBearHigh)
+    lastIdx = array.size(bearBroken) - 1
+    if lastIdx >= 0 and not array.get(bearBroken, lastIdx)
+        ln  = array.get(bearLines, lastIdx)
+        lbl = array.get(bearLabels, lastIdx)
+        if close > currentBearHigh
+            array.set(bearBroken, lastIdx, true)
+            if showBroken
+                if not na(ln)
+                    line.set_extend(ln, extend.none)
+                    line.set_x2(ln, time)
+                    line.set_style(ln, line.style_dashed)
+                    line.set_color(ln, color.new(bearHighColor, 60))
+                if not na(lbl)
+                    label.set_text(lbl, 'Bear High ' + str.tostring(array.get(bearPrices, lastIdx), format.mintick) + ' ✕')
+            else
+                if not na(ln)
+                    line.delete(ln)
+                if not na(lbl)
+                    label.delete(lbl)
+                array.pop(bearLines)
+                array.pop(bearLabels)
+                array.pop(bearPrices)
+                array.pop(bearBroken)
+                array.pop(bearBounces)
+            currentBearHigh := na
+            bearTouchActive := false
+            dailyBiasBullish := true
+        else if high >= currentBearHigh
+            if not bearTouchActive
+                newCount = array.get(bearBounces, lastIdx) + 1
+                array.set(bearBounces, lastIdx, newCount)
+                if not na(lbl)
+                    label.set_text(lbl, 'Bear High ' + str.tostring(array.get(bearPrices, lastIdx), format.mintick) + ' (bounced ' + str.tostring(newCount) + 'x)')
+            bearTouchActive := true
+        else
+            bearTouchActive := false
+
+// === Keep every STILL-ACTIVE label pinned at the right edge (current candle + a small offset)
+// every bar — same "ride along with the latest bar" behaviour as the PWL/PDL labels in smc.pine,
+// since a label (unlike a line) has no extend.right and will otherwise sit frozen back at the bar
+// where its pivot confirmed. A broken level's label is deliberately left alone here so it freezes
+// in place alongside its line, which already stopped extending at the candle that broke it. ===
+labelX = bar_index + labelOffsetBars
+if array.size(bullLabels) > 0
+    for i = 0 to array.size(bullLabels) - 1
+        if not array.get(bullBroken, i)
+            lbl = array.get(bullLabels, i)
+            if not na(lbl)
+                label.set_x(lbl, labelX)
+if array.size(bearLabels) > 0
+    for i = 0 to array.size(bearLabels) - 1
+        if not array.get(bearBroken, i)
+            lbl = array.get(bearLabels, i)
+            if not na(lbl)
+                label.set_x(lbl, labelX)
+
+// === Daily bias box (top right) ===
+var table biasTable = table.new(position.top_right, 1, 2, border_width = 1)
+
+if showBiasBox
+    table.cell(biasTable, 0, 0, 'DAILY BIAS', text_color = color.white, bgcolor = color.new(color.gray, 40), text_size = size.small)
+    table.cell(biasTable, 0, 1, dailyBiasBullish ? 'BULLISH' : 'BEARISH', text_color = color.white, bgcolor = dailyBiasBullish ? bullLowColor : bearHighColor, text_size = size.large)
