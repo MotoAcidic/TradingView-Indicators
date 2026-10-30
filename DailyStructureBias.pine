@@ -116,6 +116,9 @@ color1m  = input.color(color.new(#26a69a, 0), '1m colour', group = 'Colors')
 showBiasBox   = input.bool(true, 'Show bias box (top right)', group = 'Bias Box')
 biasBullColor = input.color(color.new(#089981, 0), 'Bias box — bullish colour', group = 'Bias Box')
 biasBearColor = input.color(color.new(#f23645, 0), 'Bias box — bearish colour', group = 'Bias Box')
+showMoveState   = input.bool(true, 'Show move state column (breakout/retracing/trending)', group = 'Bias Box')
+stateRetraceColor = input.color(color.new(#2196f3, 0), 'Move state — retracing colour', group = 'Bias Box')
+stateFormingColor = input.color(color.new(color.gray, 40), 'Move state — forming colour', group = 'Bias Box')
 
 maxPeriodsKept = 400
 
@@ -461,6 +464,60 @@ processSwingLevels(TfState s, string tfTag, bool pivotIsHigh, bool pivotIsLow, f
 
     [brokeBull, brokeBear]
 
+// @function   Finds the most recent NOT-broken entry's index in a bounded level array, scanning
+//              end — needed because a broken entry (when `showBroken` keeps it visible) can sit
+//              anywhere in the array, not just trail off at the end. Pine's `for` loop rejects a
+//              negative step outright, so this scans FORWARD and keeps overwriting `found` on
+//              every match — the last one left standing after a full forward pass is automatically
+//              the highest index, i.e. the most recent one; no backward iteration needed. Returns
+//              -1 when every entry is broken or the array is empty.
+mostRecentActiveIdx(bool[] broken) =>
+    int found = -1
+    n = array.size(broken)
+    if n > 0
+        for i = 0 to n - 1
+            if not array.get(broken, i)
+                found := i
+    found
+
+// @function   Classifies what the current move looks like for one timeframe, for the "next to
+//              bias" move-state column: a pending close-break (unconfirmed) reads as a BREAKOUT in
+//              that direction; with no pending contest, price sitting nearer the level that would
+//              overturn the current bias (support in an uptrend, resistance in a downtrend) reads
+//              as RETRACING; sitting nearer the opposite level (pushing toward new extremes in the
+//              bias direction) reads as TRENDING; with fewer than one confirmed level on each side
+//              there isn't enough structure yet to classify at all (FORMING).
+tfMoveState(TfState s, bool bullish) =>
+    string result = 'FORMING'
+    bullIdx = mostRecentActiveIdx(s.bullBroken)
+    bearIdx = mostRecentActiveIdx(s.bearBroken)
+    if bullIdx >= 0 and array.get(s.bullPending, bullIdx)
+        result := 'BREAKOUT DOWN'
+    else if bearIdx >= 0 and array.get(s.bearPending, bearIdx)
+        result := 'BREAKOUT UP'
+    else if bullIdx >= 0 and bearIdx >= 0
+        bullPrice = array.get(s.bullPrices, bullIdx)
+        bearPrice = array.get(s.bearPrices, bearIdx)
+        nearBull = math.abs(close - bullPrice) < math.abs(close - bearPrice)
+        if bullish
+            result := nearBull ? 'RETRACING' : 'TRENDING UP'
+        else
+            result := nearBull ? 'TRENDING DOWN' : 'RETRACING'
+    result
+
+// @function   Picks the move-state column's background colour for one classified state string.
+moveStateColor(string st, color bullCol, color bearCol, color retraceCol, color breakoutCol, color formingCol) =>
+    color c = formingCol
+    if st == 'TRENDING UP'
+        c := bullCol
+    else if st == 'TRENDING DOWN'
+        c := bearCol
+    else if st == 'RETRACING'
+        c := retraceCol
+    else if st == 'BREAKOUT UP' or st == 'BREAKOUT DOWN'
+        c := breakoutCol
+    c
+
 // === Per-timeframe processing — each wrapped in its own show/feasibility gate. These functions
 // take their state as a parameter rather than holding their own var/varip, so (unlike Pine's usual
 // per-call-site var-in-function pattern) it's safe to call them conditionally like this instead of
@@ -521,32 +578,44 @@ if show1m and not tooFine1m
     if brokeBear1m
         s1State.bias := true
 
-// === Bias box (top right) — one row per ENABLED timeframe, each showing that timeframe's own
-// current bias, not just Daily's. ===
+// === Bias box (top right) — one row per ENABLED timeframe, showing that timeframe's own bias
+// plus (a third column, since Pine tables can only anchor to one of 9 fixed corners — there's no
+// way to place a genuinely separate table immediately beside this one) its current move state:
+// BREAKOUT (a pending close-break, unconfirmed), RETRACING (sitting back near the level that would
+// overturn the bias), TRENDING (pushing toward new extremes in the bias direction), or FORMING
+// (not enough structure yet). ===
 enabledCount = (showDaily ? 1 : 0) + (show4h ? 1 : 0) + (show1h ? 1 : 0) + (show15m ? 1 : 0) + (show5m ? 1 : 0) + (show1m ? 1 : 0)
-var table biasTable = table.new(position.top_right, 2, math.max(enabledCount, 1), border_width = 1)
+var table biasTable = table.new(position.top_right, showMoveState ? 3 : 2, math.max(enabledCount, 1), border_width = 1)
 
-biasRow(table t, int row, string tag, bool bullish, color bullCol, color bearCol) =>
+biasRow(table t, int row, string tag, bool bullish, color bullCol, color bearCol, bool showState, string state, color stateCol) =>
     table.cell(t, 0, row, tag, text_color = color.white, bgcolor = color.new(color.gray, 40), text_size = size.small)
     table.cell(t, 1, row, bullish ? 'BULLISH' : 'BEARISH', text_color = color.white, bgcolor = bullish ? bullCol : bearCol, text_size = size.small)
+    if showState
+        table.cell(t, 2, row, state, text_color = color.white, bgcolor = stateCol, text_size = size.small)
 
 if showBiasBox
     row = 0
     if showDaily
-        biasRow(biasTable, row, 'D', dState.bias, biasBullColor, biasBearColor)
+        stateD = tfMoveState(dState, dState.bias)
+        biasRow(biasTable, row, 'D', dState.bias, biasBullColor, biasBearColor, showMoveState, stateD, moveStateColor(stateD, biasBullColor, biasBearColor, stateRetraceColor, sweepColor, stateFormingColor))
         row := row + 1
     if show4h
-        biasRow(biasTable, row, '4H', s4hState.bias, biasBullColor, biasBearColor)
+        state4h = tfMoveState(s4hState, s4hState.bias)
+        biasRow(biasTable, row, '4H', s4hState.bias, biasBullColor, biasBearColor, showMoveState, state4h, moveStateColor(state4h, biasBullColor, biasBearColor, stateRetraceColor, sweepColor, stateFormingColor))
         row := row + 1
     if show1h
-        biasRow(biasTable, row, '1H', s1hState.bias, biasBullColor, biasBearColor)
+        state1h = tfMoveState(s1hState, s1hState.bias)
+        biasRow(biasTable, row, '1H', s1hState.bias, biasBullColor, biasBearColor, showMoveState, state1h, moveStateColor(state1h, biasBullColor, biasBearColor, stateRetraceColor, sweepColor, stateFormingColor))
         row := row + 1
     if show15m
-        biasRow(biasTable, row, '15m', s15State.bias, biasBullColor, biasBearColor)
+        state15m = tfMoveState(s15State, s15State.bias)
+        biasRow(biasTable, row, '15m', s15State.bias, biasBullColor, biasBearColor, showMoveState, state15m, moveStateColor(state15m, biasBullColor, biasBearColor, stateRetraceColor, sweepColor, stateFormingColor))
         row := row + 1
     if show5m
-        biasRow(biasTable, row, '5m', s5State.bias, biasBullColor, biasBearColor)
+        state5m = tfMoveState(s5State, s5State.bias)
+        biasRow(biasTable, row, '5m', s5State.bias, biasBullColor, biasBearColor, showMoveState, state5m, moveStateColor(state5m, biasBullColor, biasBearColor, stateRetraceColor, sweepColor, stateFormingColor))
         row := row + 1
     if show1m
-        biasRow(biasTable, row, '1m', s1State.bias, biasBullColor, biasBearColor)
+        state1m = tfMoveState(s1State, s1State.bias)
+        biasRow(biasTable, row, '1m', s1State.bias, biasBullColor, biasBearColor, showMoveState, state1m, moveStateColor(state1m, biasBullColor, biasBearColor, stateRetraceColor, sweepColor, stateFormingColor))
         row := row + 1

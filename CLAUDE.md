@@ -67,6 +67,11 @@ subfolder of Quantower-storage — see that file's own note on the move.
   it does NOT simply skip like a normal "from > to" loop would in most languages. An explicit
   `by 1` step did not fix this in practice; guard with `if array.size(arr) > 0` before the loop
   instead.
+- **Pine's `for` loop rejects a negative step outright** ("'step' in loop must be greater than
+  zero") — `for i = n - 1 to 0 by -1` is not a way to iterate an array backward, it's a runtime
+  error. To find the LAST matching index in an array, loop forward from `0` and keep overwriting
+  the result on every match instead of trying to break early on the first (backward) hit — the
+  value left standing after a full forward pass is automatically the highest index.
 - **UDT (`type`) instances and the arrays stored in their fields are reference types.** A function
   that takes a UDT as a parameter and mutates its fields (`s.someField := value`,
   `array.push(s.someArray, x)`) DOES affect the caller's object — this is the pattern
